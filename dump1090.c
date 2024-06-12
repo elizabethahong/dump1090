@@ -43,6 +43,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/time.h>
 #include "rtl-sdr.h"
 #include "anet.h"
 
@@ -130,6 +131,7 @@ struct {
     pthread_cond_t data_cond;       /* Conditional variable associated. */
     unsigned char *data;            /* Raw IQ samples buffer */
     uint16_t *magnitude;            /* Magnitude vector */
+    long long time_of_arrival;         /* Timestamp at which the message was received. */
     uint32_t data_len;              /* Buffer length. */
     int fd;                         /* --ifile option file descriptor. */
     int data_ready;                 /* Data ready to be processed. */
@@ -167,7 +169,7 @@ struct {
     int interactive_ttl;            /* Interactive mode: TTL before deletion. */
     int stats;                      /* Print stats at exit in --ifile mode. */
     int onlyaddr;                   /* Print only ICAO addresses. */
-    int metric;                     /* Use metric units. */
+    int metric;                     /* computeMagnitudUse metric units. */
     int aggressive;                 /* Aggressive detection algorithm. */
 
     /* Interactive mode */
@@ -221,6 +223,7 @@ struct modesMessage {
     int vert_rate_sign;         /* Vertical rate sign. */
     int vert_rate;              /* Vertical rate. */
     int velocity;               /* Computed from EW and NS velocity. */
+    long long time;                /* Timestamp of the message. */
 
     /* DF4, DF5, DF20, DF21 */
     int fs;                     /* Flight status for DF4,5,20,21 */
@@ -1155,6 +1158,7 @@ void displayModesMessage(struct modesMessage *mm) {
     }
 
     printf("CRC: %06x (%s)\n", (int)mm->crc, mm->crcok ? "ok" : "wrong");
+    printf("Time of arrival: %lld\n", mm->time);    
     if (mm->errorbit != -1)
         printf("Single bit error fixed, bit %d\n", mm->errorbit);
 
@@ -1490,13 +1494,12 @@ good_preamble:
             use_correction = 0;
             continue;
         }
-
         /* If we reached this point, and error is zero, we are very likely
          * with a Mode S message in our hands, but it may still be broken
          * and CRC may not be correct. This is handled by the next layer. */
         if (errors == 0 || (Modes.aggressive && errors < 3)) {
             struct modesMessage mm;
-
+            mm.time = Modes.time_of_arrival;
             /* Decode the received message and update statistics */
             decodeModesMessage(&mm,msg);
 
@@ -2624,6 +2627,9 @@ int main(int argc, char **argv) {
             pthread_cond_wait(&Modes.data_cond,&Modes.data_mutex);
             continue;
         }
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        Modes.time_of_arrival = (tv.tv_sec) * 1000 * 1000 + (tv.tv_usec);
         computeMagnitudeVector();
 
         /* Signal to the other thread that we processed the available data
@@ -2631,12 +2637,9 @@ int main(int argc, char **argv) {
         Modes.data_ready = 0;
         pthread_cond_signal(&Modes.data_cond);
 
-        /* Process data after releasing the lock, so that the capturing
-         * thread can read data while we perform computationally expensive
-         * stuff * at the same time. (This should only be useful with very
-         * slow processors). */
-        pthread_mutex_unlock(&Modes.data_mutex);
         detectModeS(Modes.magnitude, Modes.data_len/2);
+        pthread_mutex_unlock(&Modes.data_mutex);
+        
         backgroundTasks();
         pthread_mutex_lock(&Modes.data_mutex);
         if (Modes.exit) break;
